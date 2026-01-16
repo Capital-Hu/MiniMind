@@ -74,9 +74,11 @@ class MokioMindConfig(PretrainedConfig):
 import math
 import torch
 from torch import nn
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 from torch.nn import functional as F
 from transformers.activations import ACT2FN
+from transformers import PreTrainedModel, GenerationMixin
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 # 继承nn.Module类
 class RMSNorm(nn.Module):
@@ -370,4 +372,56 @@ class MokioMindModel(nn.Module):
         hidden_states = self.norm(hidden_states)
 
         return hidden_states, presents
+    
+
+class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = MokioMindConfig
+
+    def __init__(self, config:MokioMindConfig):
+        self.config = config
+
+        super().__init__(config)
+
+        self.model = MokioMindModel(config)
+
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # 将lm_head的权重与嵌入层的权重共享
+        self.model.embed_tokens.weight = self.lm_head.weight
+
+        self.OUT = CausalLMOutputWithPast()
+
+    def forward(
+            self, 
+            input_ids:Optional[torch.Tensor]=None, 
+            attention_mask:Optional[torch.Tensor]=None, 
+            past_key_values:Optional[Tuple[Tuple[torch.Tensor]]]=None, 
+            use_cache:bool=False,
+            logits_to_keep:Union[int, torch.Tensor]=0,
+            **args
+    ):
+        
+        hidden_states, past_key_values = self.model(
+            input_ids=input_ids, 
+            attention_mask=attention_mask, 
+            past_key_values=past_key_values, 
+            use_cache=use_cache,
+            **args
+        )
+
+        # logits_to_keep是整数 则保留最后n个位置
+        # 生成的时候只需要最后的n个logits来预测下一个token
+        # 如果是张量 则表示保留指定位置的logits
+        slice_indices = (
+            slice(-logits_to_keep, None)
+            if isinstance (logits_to_keep, int) 
+            else logits_to_keep
+        )
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
+
+        self.OUT.__setitem__('last_hidden_state', hidden_states)
+        self.OUT.__setitem__('logits', logits)
+        self.OUT.__setitem__('past_key_values', past_key_values)
+
+        return self.OUT
     

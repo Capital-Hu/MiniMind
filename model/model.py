@@ -76,6 +76,7 @@ import torch
 from torch import nn
 from typing import Optional, Tuple
 from torch.nn import functional as F
+from transformers.activations import ACT2FN
 
 # 继承nn.Module类
 class RMSNorm(nn.Module):
@@ -250,4 +251,53 @@ class Attention(nn.Module):
         output = self.resid_dropout(self.o_proj(output))
 
         return output, past_kv
-            
+    
+
+class FeedForward(nn.Module):
+    def __init__(self, args:MokioMindConfig):
+        super().__init__()
+        if args.intermediate_size is None:
+            intermediate_size = int(args.hidden_size * 8 / 3)
+            args.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
+
+        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
+        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.dropout = nn.Dropout(args.dropout)
+        self.act_fn = ACT2FN[args.hidden_act]
+
+    def forward(self, x):
+        return self.dropout(
+            self.down_proj(
+                self.act_fn(self.up_proj(x)) * self.gate_proj(x)
+            )
+        )
+    
+
+class MokioMindBlock(nn.Module):
+    def __init__(self, layer_id:int, args:MokioMindConfig):
+        super().__init__()
+        self.num_attention_heads = args.num_attention_heads
+        self.hidden_size = args.hidden_size
+        self.head_dim = self.hidden_size // self.num_attention_heads
+        self.self_attn = Attention(args)
+
+        self.layer_id = layer_id
+        self.input_layernorm = RMSNorm(self.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(self.hidden_size, eps=args.rms_norm_eps)
+        self.mlp = FeedForward(args)
+
+    def forward(self, hidden_states, position_embedding, past_key_value=None, use_cache=False, attention_mask=None):
+        residual = hidden_states
+        hidden_states, present_key_value = self.self_attn(
+            self.input_layernorm(hidden_states), 
+            position_embedding, 
+            past_key_value=past_key_value, 
+            use_cache=use_cache, 
+            attention_mask=attention_mask,
+        )
+        hidden_states = residual + hidden_states
+        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+        return hidden_states, present_key_value
+
+       

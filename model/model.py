@@ -89,7 +89,7 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def _norm(self, x):
-        return torch.rsqrt(x.pow(2).mean(-1, keepdim=True)+self.eps)
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True)+self.eps)
     
     def forward(self, x):
         return self.weight * self._norm(x.float()).type_as(x)
@@ -102,7 +102,7 @@ def precompute_freqs_cis(
         rope_scaling:dict=None,
     ):
     # 写出最初的RoPE式子
-    freqs = 1.0 / rope_base ** (torch.arange(0, dim, 2)[: dim // 2].float())
+    freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: dim // 2].float() / dim))
 
     if rope_scaling is not None:
         orig_max, factor, beta_fast, beta_slow = (
@@ -111,24 +111,25 @@ def precompute_freqs_cis(
             rope_scaling.get("beta_fast", 4),
             rope_scaling.get("beta_slow", 1),
         )
-        # 计算curr_dim
-        curr_dim = next((i for i in range(dim//2) if 2*math.pi/freqs[i]>orig_max), dim//2)
+        if end/orig_max > 1.0:
+            # 计算curr_dim
+            curr_dim = next((i for i in range(dim//2) if 2*math.pi/freqs[i]>orig_max), dim//2)
 
-        # 计算power
-        power = torch.arange(0, dim//2, device=freqs.device).float() / max(dim//2-1, 1)
+            # 计算power
+            power = torch.arange(0, dim//2, device=freqs.device).float() / max(dim//2-1, 1)
 
-        # 计算beta
-        beta = beta_slow + (beta_fast - beta_slow) * power
+            # 计算beta
+            beta = beta_slow + (beta_fast - beta_slow) * power
 
-        # 计算scale
-        scale = torch.where(
-            torch.arange(dim//2, device=freqs.device) < curr_dim,
-            (beta * factor - beta + 1) / (beta * factor),
-            1.0/factor
-        )
+            # 计算scale
+            scale = torch.where(
+                torch.arange(dim//2, device=freqs.device) < curr_dim,
+                (beta * factor - beta + 1) / (beta * factor),
+                1.0/factor
+            )
 
-        # 应用scale
-        freqs = freqs * scale
+            # 应用scale
+            freqs = freqs * scale
 
     # 生成位置索引 与频率相乘
     t = torch.arange(end, device=freqs.device)
@@ -167,7 +168,11 @@ class Attention(nn.Module):
     def __init__(self, args:MokioMindConfig):
         super().__init__()
 
-        self.num_key_value_heads = args.num_key_value_heads if args.num_key_value_heads is not None else args.num_attention_heads
+        self.num_key_value_heads = (
+            args.num_attention_heads 
+            if args.num_key_value_heads is None 
+            else args.num_key_value_heads
+        )
 
         assert args.num_attention_heads % self.num_key_value_heads == 0, "num_attention_heads must be divisible by num_key_value_heads"
 
@@ -178,7 +183,7 @@ class Attention(nn.Module):
         self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_key_value_heads * self.head_dim, args.hidden_size, bias=False)
+        self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias=False)
 
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
@@ -389,8 +394,6 @@ class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
         # 将lm_head的权重与嵌入层的权重共享
         self.model.embed_tokens.weight = self.lm_head.weight
 
-        self.OUT = CausalLMOutputWithPast()
-
     def forward(
             self, 
             input_ids:Optional[torch.Tensor]=None, 
@@ -419,9 +422,9 @@ class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
         )
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
-        self.OUT.__setitem__('last_hidden_state', hidden_states)
-        self.OUT.__setitem__('logits', logits)
-        self.OUT.__setitem__('past_key_values', past_key_values)
-
-        return self.OUT
+        return CausalLMOutputWithPast(
+            logits=logits,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states,
+        )
     
